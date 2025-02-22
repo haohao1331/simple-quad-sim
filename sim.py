@@ -1,6 +1,7 @@
 import scipy.spatial.transform
 import numpy as np
 from animate_function import QuadPlotter
+import matplotlib.pyplot as plt
 
 def quat_mult(q, p):
     # q * p
@@ -77,6 +78,9 @@ class Robot:
         self.time = 0.0
         self.a_adapt = np.array([0.0, 0.0, 0.0])
 
+        # for storing the trajectory
+        self.trajectory = []
+
     def reset_state_and_input(self, init_xyz, init_quat_wxyz):
         state0 = np.zeros(NO_STATES)
         state0[IDX_POS_X:IDX_POS_Z+1] = init_xyz
@@ -111,23 +115,40 @@ class Robot:
         self.state[IDX_QUAT_W:IDX_QUAT_Z+1] /= np.linalg.norm(self.state[IDX_QUAT_W:IDX_QUAT_Z+1]) # Re-normalize quaternion.
         self.time += dt
 
+        self.trajectory.append(self.state.copy())
+        print(self.state[IDX_POS_X:IDX_POS_Z+1])
+
     def control(self, p_d_I, v_d_I=None):
+        assert p_d_I.shape == (3,), p_d_I.shape
+        assert v_d_I.shape == (3,), v_d_I.shape
         p_I = self.state[IDX_POS_X:IDX_POS_Z+1]
         v_I = self.state[IDX_VEL_X:IDX_VEL_Z+1]
         q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1]
         omega_b = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1]
 
         # Position controller.
-        k_p = 1.0
-        k_d = 10.0
-        k_I = 5.0
-        v_d_I = np.zeros(3) # TODO: add this in from the trajectory, take the derivative of the pos
-        v_r = v_d_I - k_p * (p_I - p_d_I)
-        s = v_I - v_r
+        k_p = 0.3
+        k_d = 3.5
+        k_I = 2
+        
+        if v_d_I is None:
+            v_d_I = np.zeros(3)
+        
+        s = (v_I - v_d_I) + k_p * (p_I - p_d_I)
         a = -k_d * s + np.array([0, 0, 9.81]) - k_I * self.a_adapt
         self.a_adapt = self.a_adapt + s * dt
-        f = self.m * a
-        f_b = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().T @ f
+
+
+        # k_p = 2
+        # k_d = 2
+        # k_I = 2.0
+        # e = p_I - p_d_I
+        # e_dot = v_I - v_d_I
+        # a = -k_d * e_dot - k_p * e + np.array([0, 0, 9.81]) - k_I * self.a_adapt
+        # self.a_adapt = self.a_adapt + e * dt
+
+        f = self.m * a      # force in inertial frame
+        f_b = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().T @ f     # force in body frame
         thrust = np.max([0, f_b[2]])
         
         # Attitude controller.
@@ -158,6 +179,9 @@ CONTROL_FREQUENCY = 200 # Hz for attitude control loop
 dt = 1.0 / CONTROL_FREQUENCY
 time = [0.0]
 
+def get_reference_velocity(ref_trajectory : np.ndarray):
+    return np.gradient(ref_trajectory, axis=0) / dt
+
 def get_pos_full_quadcopter(quad : Robot):
     """ position returns a 3 x 6 matrix 
         where row is [x, y, z] column is m1 m2 m3 m4 origin h
@@ -171,34 +195,105 @@ def get_pos_full_quadcopter(quad : Robot):
     pos_full_quad = quadWorldFrame[0:3]
     return pos_full_quad
 
-def control_propellers(quad : Robot):
+def control_propellers_2_1(quad : Robot):
     t = quad.time
     T = 1.5
     r = 2*np.pi * t / T
-    # prop_thrusts = quad.control(p_d_I = np.array([np.cos(r/2), np.sin(r), 0.0]))
-    # Note: for Hover mode, just replace the desired trajectory with [1, 0, 1]
+    prop_thrusts = np.array([100, 0, 100, 0])
+    quad.update(prop_thrusts, dt)
 
-    # Part 2.1
-    # prop_thrusts = np.array([100, 0, 100, 0])
-    # quad.update(prop_thrusts, dt)
+def control_propellers_2_2(quad : Robot):
+    t = quad.time
+    T = 1.5
+    r = 2*np.pi * t / T
     F_wind = np.zeros(3)
-    if t > 4.0:
-        print(t)
+    if t > 1.0:
         F_wind = np.array([10.0, 0, 0])
 
-    # Part 2.2
+    # # Part 2.2
     prop_thrusts = quad.control(p_d_I = np.array([0, 0, 0]))
     quad.update(prop_thrusts, dt, F_wind)
 
+def run_simulation(quadcopter : Robot, ref_trajectory : np.ndarray, vel_trajectory : np.ndarray, sim_time : float, wind_direction : np.ndarray, amplitude : float, omega : float, phi : float, display_animation : bool = True):
+    assert ref_trajectory.shape[1] == 3
+    if display_animation:
+        print("Displaying animation")
+        def control_loop(i):
+            print(i)
+            if i > len(vel_trajectory):
+                exit()
+            F_wind = wind_direction * amplitude * np.cos(omega * quadcopter.time + phi)
+            prop_thrusts = quadcopter.control(p_d_I = ref_trajectory[i], 
+                                        # v_d_I = v_d_I[i]
+                                        v_d_I = vel_trajectory[i]
+                                        )
+            quadcopter.update(prop_thrusts, dt, F_wind)
+            return get_pos_full_quadcopter(quadcopter)
+        plotter = QuadPlotter()
+        plotter.plot_animation(control_loop)
+    else:
+        for i in range(int(sim_time / dt)):
+            t = quadcopter.time
+            F_wind = wind_direction * amplitude * np.cos(omega * t + phi)
+            prop_thrusts = quadcopter.control(p_d_I = ref_trajectory[i], 
+                                        v_d_I = vel_trajectory[i]
+                                        # v_d_I = np.zeros(3)
+                                        )
+            quadcopter.update(prop_thrusts, dt, F_wind)
+
+# def gather_training_data():
+#     quadcopter = Robot()
+#     sim_time = 10.0 
+#     wind_direction = np.array([1, 0, 0])
+#     amplitude = 10.0
+#     omega = 1.0
+#     phi = 0.0
+#     run_simulation(quadcopter, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+
 def main():
     quadcopter = Robot()
-    def control_loop(i):
-        for _ in range(PLAYBACK_SPEED):
-            control_propellers(quadcopter)
-        return get_pos_full_quadcopter(quadcopter)
+    # plotter = QuadPlotter()
+    # plotter.plot_animation(control_loop)
+    sim_time = 10.0 
+    T = 3
+    r = 2*np.pi * np.linspace(0, sim_time, int(sim_time / dt)) / T
+    ref_trajectory = np.vstack([np.cos(r/2 - np.pi/2), np.sin(r), np.zeros(len(r))]).T
+    v_d_I = get_reference_velocity(ref_trajectory)
+    # plt.figure()
+    # plt.plot(ref_trajectory[:,0], ref_trajectory[:,1], 'r--', label='Reference Trajectory')
+    # # plt.plot(np.diff(ref_trajectory[:,0], axis=0) / dt, np.diff(ref_trajectory[:,1], axis=0) / dt, 'b--', label='Reference Velocity')
+    # plt.plot(vel_trajectory[:,0], vel_trajectory[:,1], 'b--', label='Reference Velocity')
+    # # plt.plot(ref_trajectory[0,0], ref_trajectory[0,1], 'go', markersize=10, label='Start')
+    # plt.plot(v_d_I[:,0], v_d_I[:,1], 'g-', label='Reference Velocity')
+    # plt.xlabel('x')
+    # plt.ylabel('y')
+    # plt.title('Reference Trajectory (Top View)')
+    # plt.legend()
+    # plt.grid(True)
+    # plt.show()
 
-    plotter = QuadPlotter()
-    plotter.plot_animation(control_loop)
+    # exit()
+    wind_direction = np.array([1, 0, 0])
+    amplitude = 1.0
+    omega = 1.0
+    phi = 0.0
+
+    run_simulation(quadcopter, ref_trajectory, v_d_I, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+
+    trajectory = np.array(quadcopter.trajectory)
+    print(trajectory.shape)
+    print(trajectory[0:10,0], trajectory[0:10,1])
+    plt.figure()
+    plt.plot(ref_trajectory[:,0], ref_trajectory[:,1], 'r--', label='Reference Trajectory')
+    plt.plot(trajectory[:,IDX_POS_X], trajectory[:,IDX_POS_Y], 'b-', label='Actual Trajectory')
+    # plt.plot(ref_trajectory[0,0], ref_trajectory[0,1], 'go', markersize=10, label='Start')
+    # plt.plot(ref_trajectory[-1,0], ref_trajectory[-1,1], 'ro', markersize=10, label='End')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title('Reference vs Actual Trajectory (Top View)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 if __name__ == "__main__":
     main()
