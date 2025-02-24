@@ -1,13 +1,11 @@
 from pathlib import Path
 import pandas as pd
 from torch.utils.data import Dataset
-import torch
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 def extract_params(filename : Path):
-    # Extract parameters from filename
+    ''' Extract wind direction, amplitude, and omega from the filename. '''
     params = str(filename.stem).split('_')
     direction = params[0].replace('dir', '').replace('[', '').replace(']', '')
     amp = float(params[1].replace('amp', ''))
@@ -19,6 +17,7 @@ def extract_params(filename : Path):
     return direction_vec, amp, omega
 
 def get_all_wind_directions(dir_path : Path):
+    ''' Get all unique wind directions from the trajectory files in the given directory. '''
     all_files = list(dir_path.glob("*trajectory.npy"))
     all_wind_directions = []
     for file in all_files:
@@ -32,11 +31,7 @@ class TrajectoryDataset(Dataset):
         self.data_dir = data_dir
         self.trajectory_files = sorted(list(self.data_dir.glob("*trajectory.npy")))
         self.wind_directions = get_all_wind_directions(data_dir)
-        self.amps = []
-        self.omegas = []
-
         self.trajectory_lengths = []
-
         self.data = pd.DataFrame(columns=['wind_direction_idx', 'amp', 'omega', 'trajectory'])
         for file in tqdm(self.trajectory_files):
             wind_direction, amp, omega = extract_params(file)
@@ -47,8 +42,6 @@ class TrajectoryDataset(Dataset):
             states = np.load(file)
 
             combined_data = np.hstack((f_wind, omega_motor, states))
-            self.amps.append(amp)
-            self.omegas.append(omega)
 
             # Add row to dataframe
             wind_direction_idx = np.where(np.all(self.wind_directions == wind_direction, axis=1))[0][0]
@@ -66,13 +59,12 @@ class TrajectoryDataset(Dataset):
         if not np.all(self.trajectory_lengths == self.trajectory_lengths[0]):
             raise ValueError(f"All trajectories must have the same length. Found lengths: {np.unique(self.trajectory_lengths)}")
 
-
         self.trajectory_length = self.trajectory_lengths[0]
         del self.trajectory_lengths
         
         self.np_data = np.concatenate(self.data['trajectory'].to_numpy())
-        self.X = self.np_data[:, np.r_[3:10, 13:17]]
-        self.Y = self.np_data[:, 17:20]
+        self.X = self.np_data[:, np.r_[3:10, 13:17]]    # corresponds to angular velocity, quarternion, and motor speeds
+        self.Y = self.np_data[:, 17:20]     # the x y z component of wind force
         self.c = np.repeat(self.data['amp'].to_numpy(), self.trajectory_length)
         print(f'X.shape: {self.X.shape} Y.shape: {self.Y.shape} c.shape: {self.c.shape}')
 
@@ -87,24 +79,7 @@ class TrajectoryDataset(Dataset):
         return self.X.shape[0]
     
     def __getitem__(self, idx):
-        # # Get the trajectory length and file index
-        # file_idx = idx // self.trajectory_length
-        # trajectory_idx = idx % self.trajectory_length
-        
-        # # Get the trajectory and corresponding data
-        # trajectory = self.data.iloc[file_idx]['trajectory'][trajectory_idx]
-        # # wind_direction_idx = self.data.iloc[file_idx]['wind_direction_idx']
-        # # amp = self.data.iloc[file_idx]['amp']
-        # # omega = self.data.iloc[file_idx]['omega']
-
-        # return trajectory[np.r_[3:10, 13:17]], trajectory[17:20] 
         return self.X[idx], self.Y[idx], self.c[idx]
-
-    def get_wind_amplitude_data(self, idx):
-        assert idx < self.amps.shape[0], f"Index out of bounds {idx}"
-
-        amp = self.amps[idx]
-        return self.data[self.data['amp'] == amp]
     
 if __name__ == "__main__":
     data_dir = Path('/Users/yefan/Desktop/CDS245/simple-quad-sim/data')

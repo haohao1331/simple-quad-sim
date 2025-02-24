@@ -1,16 +1,15 @@
+''' 
+This file is mostly a copy of https://github.com/aerorobotics/neural-fly/blob/main/mlmodel.py
+There are some simplifications
+'''
+
 import collections
 import os
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils import data
 torch.set_default_tensor_type('torch.DoubleTensor')
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.dataset import random_split
 
 Model = collections.namedtuple('Model', 'phi h options')
 

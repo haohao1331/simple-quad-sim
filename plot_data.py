@@ -1,3 +1,7 @@
+'''
+contains helper functions for visualization, not used in main code
+'''
+
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path

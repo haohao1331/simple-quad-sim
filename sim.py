@@ -134,6 +134,9 @@ class Robot:
         self.F_winds.append(F_wind.copy())
 
     def control(self, p_d_I, v_d_I=None):
+        '''
+        This is the controller without the neural fly component. Implements an integral controller
+        '''
         assert p_d_I.shape == (3,), p_d_I.shape
         assert v_d_I.shape == (3,), v_d_I.shape
         p_I = self.state[IDX_POS_X:IDX_POS_Z+1]
@@ -181,11 +184,12 @@ class Robot:
         return omega_motor
 
     def control_adapt(self, p_d_I, v_d_I=None):
+        '''
+        This is the controller with the neural fly component. implements the controller specified in the paper
+        '''
         assert p_d_I.shape == (3,), p_d_I.shape
         assert v_d_I.shape == (3,), v_d_I.shape
-        lamb = 0.9
-        R_inv = np.eye(3)
-        Q = np.eye(3)
+        
 
         p_I = self.state[IDX_POS_X:IDX_POS_Z+1]
         v_I = self.state[IDX_VEL_X:IDX_VEL_Z+1]
@@ -197,13 +201,18 @@ class Robot:
         k_p = 0.3
         k_d = 3.5
         k_I = 2
+
+        # adaptation parameters
+        lamb = 0.9
+        R_inv = np.eye(3)
+        Q = np.eye(3)
         
         if v_d_I is None:
             v_d_I = np.zeros(3)
         
         s = (v_I - v_d_I) + k_p * (p_I - p_d_I)
         self.a_adapt = self.a_adapt + s * dt
-        if len(self.omegas_motors) == 0:
+        if len(self.omegas_motors) == 0:    # the first timestamp there's no omegas_motors
             phi_net_input = np.concatenate([self.state[IDX_VEL_X:IDX_VEL_Z+1], self.state[IDX_QUAT_W:IDX_QUAT_Z+1], np.zeros(4)])
         else:
             phi_net_input = np.concatenate([self.state[IDX_VEL_X:IDX_VEL_Z+1], self.state[IDX_QUAT_W:IDX_QUAT_Z+1], self.omegas_motors[-1]])
@@ -262,12 +271,72 @@ def get_pos_full_quadcopter(quad : Robot):
     pos_full_quad = quadWorldFrame[0:3]
     return pos_full_quad
 
-def control_propellers_2_1(quad : Robot):
-    t = quad.time
-    T = 1.5
-    r = 2*np.pi * t / T
-    prop_thrusts = np.array([100, 0, 100, 0])
-    quad.update(prop_thrusts, dt)
+def part_2_1():
+    quad = Robot()
+    sim_time = 10.0
+    # def control_loop(i):
+    #     t = quad.time
+    #     T = 1.5
+    #     r = 2*np.pi * t / T
+    #     prop_thrusts = np.array([100, 0, 100, 0])
+    #     quad.update(prop_thrusts, dt)
+    #     return get_pos_full_quadcopter(quad)
+    # plotter = QuadPlotter()
+    # plotter.plot_animation(control_loop)
+    for i in range(int(sim_time / dt)):
+        t = quad.time
+        T = 1.5
+        r = 2*np.pi * t / T
+        prop_thrusts = np.array([100, 0, 100, 0])
+        quad.update(prop_thrusts, dt)
+    
+    trajectory = np.array(quad.trajectory)
+
+    plt.plot(np.arange(0, sim_time, dt), trajectory[:,IDX_POS_Z], 'b-', label='z position')
+    plt.plot(np.arange(0, sim_time, dt), trajectory[:, IDX_OMEGA_Z], 'r-', label='z angular velocity')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Value')
+    plt.title('z position and z angular velocity over time')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def part_2_2():
+    quad = Robot()
+    sim_time = 10.0
+    # def control_loop(i):
+    #     t = quad.time
+    #     T = 1.5
+    #     F_wind = np.zeros(3)
+    #     if t > 0.5:
+    #         F_wind = np.array([2.0, 0, 0])
+
+    #     prop_thrusts = quad.control(p_d_I = np.zeros(3), 
+    #                                 v_d_I = np.zeros(3))
+    #     quad.update(prop_thrusts, dt, F_wind)
+    #     return get_pos_full_quadcopter(quad)
+    # plotter = QuadPlotter()
+    # plotter.plot_animation(control_loop)
+    for i in range(int(sim_time / dt)):
+        t = quad.time
+        T = 1.5
+        F_wind = np.zeros(3)
+        if t > 0.5:
+            F_wind = np.array([2.0, 0, 0])
+        prop_thrusts = quad.control(p_d_I = np.zeros(3), 
+                                    v_d_I = np.zeros(3))
+        quad.update(prop_thrusts, dt, F_wind)
+    
+    trajectory = np.array(quad.trajectory)
+
+    plt.plot(np.arange(0, sim_time, dt), trajectory[:, IDX_POS_X], 'b-', label='x position')
+    # plt.plot(np.arange(0, sim_time, dt), trajectory[:, IDX_POS_Y], 'r-', label='y position')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Value')
+    plt.title('x position over time')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 def control_propellers_2_2(quad : Robot):
     t = quad.time
@@ -371,6 +440,9 @@ def gather_training_data():
     
 
 def main():
+    '''
+    everything here is mostly for testing, not used in main homework submission
+    '''
     quadcopter = Robot()
     # plotter = QuadPlotter()
     # plotter.plot_animation(control_loop)
@@ -415,7 +487,7 @@ def main():
     plt.grid(True)
     plt.show()
 
-def sim_with_model():
+def part_4():
     model_path = Path('/Users/yefan/Desktop/CDS245/simple-quad-sim/models/epoch850.pth')
     phi_net = load_model(model_path)
     quadcopter1 = Robot(phi_net=phi_net)
@@ -428,7 +500,7 @@ def sim_with_model():
 
     wind_direction = np.array([1, 0, 0])
     amplitude = 2
-    omega = 1
+    omega = 2
     phi = 0.0
 
     run_simulation_NF(quadcopter1, ref_trajectory, vel_trajectory, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
@@ -439,11 +511,9 @@ def sim_with_model():
     plt.plot(ref_trajectory[:,0], ref_trajectory[:,1], 'r--', label='Reference Trajectory')
     plt.plot(trajectory2[:,IDX_POS_X], trajectory2[:,IDX_POS_Y], 'g-', label='Trajectory')
     plt.plot(trajectory1[:,IDX_POS_X], trajectory1[:,IDX_POS_Y], 'b-', label='NF Trajectory')
-    # plt.plot(ref_trajectory[0,0], ref_trajectory[0,1], 'go', markersize=10, label='Start')
-    # plt.plot(ref_trajectory[-1,0], ref_trajectory[-1,1], 'ro', markersize=10, label='End')
     plt.xlabel('x')
     plt.ylabel('y')
-    plt.title('Reference vs Actual Trajectory (Top View)')
+    plt.title(f'Reference vs Actual Trajectory (Top View), wind amp={amplitude}, omega={omega}')
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -451,5 +521,6 @@ def sim_with_model():
 
 
 if __name__ == "__main__":
-    # main()
-    sim_with_model()
+    # part_2_1()
+    # part_2_2()
+    part_4()
