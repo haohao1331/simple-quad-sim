@@ -2,6 +2,10 @@ import scipy.spatial.transform
 import numpy as np
 from animate_function import QuadPlotter
 import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+from model import Phi_Net, load_model
+import torch
 
 def quat_mult(q, p):
     # q * p
@@ -58,7 +62,7 @@ class Robot:
     inputs:
         omega_1, omega_2, omega_3, omega_4 - angular velocities of the motors
     '''
-    def __init__(self):
+    def __init__(self, phi_net : Phi_Net=None):
         self.m = 1.0 # mass of the robot
         self.arm_length = 0.25 # length of the quadcopter arm (motor to center)
         self.height = 0.05 # height of the quadcopter
@@ -73,13 +77,20 @@ class Robot:
         self.J_inv = np.linalg.inv(self.J)
         self.constant_thrust = 10e-4
         self.constant_drag = 10e-6
-        self.omega_motors = np.array([0.0, 0.0, 0.0, 0.0])
         self.state = self.reset_state_and_input(np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
         self.time = 0.0
         self.a_adapt = np.array([0.0, 0.0, 0.0])
 
         # for storing the trajectory
         self.trajectory = []
+        self.omegas_motors = []
+        self.F_winds = []
+
+        if phi_net is not None:
+            self.phi_net = phi_net
+            self.a_hat = np.zeros(self.phi_net.dim_a)
+            self.P = np.eye(self.phi_net.dim_a) * 0.1
+        
 
     def reset_state_and_input(self, init_xyz, init_quat_wxyz):
         state0 = np.zeros(NO_STATES)
@@ -87,6 +98,9 @@ class Robot:
         state0[IDX_VEL_X:IDX_VEL_Z+1] = np.array([0.0, 0.0, 0.0])
         state0[IDX_QUAT_W:IDX_QUAT_Z+1] = init_quat_wxyz
         state0[IDX_OMEGA_X:IDX_OMEGA_Z+1] = np.array([0.0, 0.0, 0.0])
+        self.trajectory = []
+        self.omegas_motors = []
+        self.F_winds = []
         return state0
 
     def update(self, omegas_motor, dt, F_wind=np.zeros(3)):
@@ -116,7 +130,8 @@ class Robot:
         self.time += dt
 
         self.trajectory.append(self.state.copy())
-        print(self.state[IDX_POS_X:IDX_POS_Z+1])
+        self.omegas_motors.append(omegas_motor.copy())
+        self.F_winds.append(F_wind.copy())
 
     def control(self, p_d_I, v_d_I=None):
         assert p_d_I.shape == (3,), p_d_I.shape
@@ -138,15 +153,6 @@ class Robot:
         a = -k_d * s + np.array([0, 0, 9.81]) - k_I * self.a_adapt
         self.a_adapt = self.a_adapt + s * dt
 
-
-        # k_p = 2
-        # k_d = 2
-        # k_I = 2.0
-        # e = p_I - p_d_I
-        # e_dot = v_I - v_d_I
-        # a = -k_d * e_dot - k_p * e + np.array([0, 0, 9.81]) - k_I * self.a_adapt
-        # self.a_adapt = self.a_adapt + e * dt
-
         f = self.m * a      # force in inertial frame
         f_b = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().T @ f     # force in body frame
         thrust = np.max([0, f_b[2]])
@@ -161,6 +167,67 @@ class Robot:
         omega_ref = - k_q * 2 * q_err[1:]
         alpha = - k_omega * (omega_b - omega_ref)
         tau = self.J @ alpha + np.cross(omega_b, self.J @ omega_b) # + self.J @ omega_ref_dot
+        
+        # Compute the motor speeds.
+        B = np.array([
+            [self.constant_thrust, self.constant_thrust, self.constant_thrust, self.constant_thrust],
+            [0, -self.arm_length * self.constant_thrust, 0, self.arm_length * self.constant_thrust],
+            [-self.arm_length * self.constant_thrust, 0, self.arm_length * self.constant_thrust, 0],
+            [self.constant_drag, -self.constant_drag, self.constant_drag, -self.constant_drag]
+        ])
+        B_inv = np.linalg.inv(B)
+        omega_motor_square = B_inv @ np.concatenate([np.array([thrust]), tau])
+        omega_motor = np.sqrt(np.clip(omega_motor_square, 0, None))
+        return omega_motor
+
+    def control_adapt(self, p_d_I, v_d_I=None):
+        assert p_d_I.shape == (3,), p_d_I.shape
+        assert v_d_I.shape == (3,), v_d_I.shape
+        lamb = 0.9
+        R_inv = np.eye(3)
+        Q = np.eye(3)
+
+        p_I = self.state[IDX_POS_X:IDX_POS_Z+1]
+        v_I = self.state[IDX_VEL_X:IDX_VEL_Z+1]
+        q = self.state[IDX_QUAT_W:IDX_QUAT_Z+1]
+        assert np.isclose(np.linalg.norm(q), 1), f"Quaternion is not normalized: {np.linalg.norm(q)}"
+        omega_b = self.state[IDX_OMEGA_X:IDX_OMEGA_Z+1]
+
+        # Position controller.
+        k_p = 0.3
+        k_d = 3.5
+        k_I = 2
+        
+        if v_d_I is None:
+            v_d_I = np.zeros(3)
+        
+        s = (v_I - v_d_I) + k_p * (p_I - p_d_I)
+        self.a_adapt = self.a_adapt + s * dt
+        if len(self.omegas_motors) == 0:
+            phi_net_input = np.concatenate([self.state[IDX_VEL_X:IDX_VEL_Z+1], self.state[IDX_QUAT_W:IDX_QUAT_Z+1], np.zeros(4)])
+        else:
+            phi_net_input = np.concatenate([self.state[IDX_VEL_X:IDX_VEL_Z+1], self.state[IDX_QUAT_W:IDX_QUAT_Z+1], self.omegas_motors[-1]])
+        phi = self.phi_net(torch.tensor(phi_net_input, dtype=torch.double)).detach().numpy()
+        phi = np.diag(phi.flatten())
+        self.a_hat = self.a_hat.reshape(3, 1)
+        f = self.m * -k_d * s + np.array([0, 0, 9.81]) - k_I * self.a_adapt - (phi @ self.a_hat).reshape(-1)     # force in inertial frame
+        f_b = scipy.spatial.transform.Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().T @ f     # force in body frame
+        thrust = np.max([0, f_b[2]])
+
+        # Adaptation law
+        self.a_hat = (self.a_hat).reshape(-1) + (- lamb * (self.a_hat).reshape(-1) - (self.P @ phi.T @ R_inv @ phi @ self.a_hat).reshape(-1) + self.P @ phi.T @ s) * dt
+        self.P = self.P + (- 2 * lamb * self.P + Q  - self.P @ phi.T @ R_inv @ phi @ self.P) * dt
+        
+        # Attitude controller.
+        q_ref = quaternion_from_vectors(np.array([0, 0, 1]), normalized(f))
+        q_err = quat_mult(quat_conjugate(q_ref), q) # error from Body to Reference.
+        if q_err[0] < 0:
+            q_err = -q_err
+        k_q = 20.0
+        k_omega = 100.0
+        omega_ref = - k_q * 2 * q_err[1:]
+        alpha = - k_omega * (omega_b - omega_ref)
+        tau = self.J @ alpha + np.cross(omega_b, self.J @ omega_b)
         
         # Compute the motor speeds.
         B = np.array([
@@ -241,14 +308,67 @@ def run_simulation(quadcopter : Robot, ref_trajectory : np.ndarray, vel_trajecto
                                         )
             quadcopter.update(prop_thrusts, dt, F_wind)
 
-# def gather_training_data():
-#     quadcopter = Robot()
-#     sim_time = 10.0 
-#     wind_direction = np.array([1, 0, 0])
-#     amplitude = 10.0
-#     omega = 1.0
-#     phi = 0.0
-#     run_simulation(quadcopter, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+def run_simulation_NF(quadcopter : Robot, ref_trajectory : np.ndarray, vel_trajectory : np.ndarray, sim_time : float, wind_direction : np.ndarray, amplitude : float, omega : float, phi : float, display_animation : bool = True):
+    assert ref_trajectory.shape[1] == 3
+    if display_animation:
+        print("Displaying animation")
+        def control_loop(i):
+            print(i)
+            if i > len(vel_trajectory):
+                exit()
+            F_wind = wind_direction * amplitude * np.cos(omega * quadcopter.time + phi)
+            prop_thrusts = quadcopter.control_adapt(p_d_I = ref_trajectory[i], 
+                                        # v_d_I = v_d_I[i]
+                                        v_d_I = vel_trajectory[i]
+                                        )
+            quadcopter.update(prop_thrusts, dt, F_wind)
+            return get_pos_full_quadcopter(quadcopter)
+        plotter = QuadPlotter()
+        plotter.plot_animation(control_loop)
+    else:
+        for i in range(int(sim_time / dt)):
+            t = quadcopter.time
+            F_wind = wind_direction * amplitude * np.cos(omega * t + phi)
+            prop_thrusts = quadcopter.control_adapt(p_d_I = ref_trajectory[i], 
+                                        v_d_I = vel_trajectory[i]
+                                        # v_d_I = np.zeros(3)
+                                        )
+            quadcopter.update(prop_thrusts, dt, F_wind)
+
+def gather_training_data():
+    data_dir = Path('/Users/yefan/Desktop/CDS245/simple-quad-sim/data')
+
+    quadcopter = Robot()
+    sim_time = 20.0
+    num_directions = 5
+    T = 3
+    r = 2*np.pi * np.linspace(0, sim_time, int(sim_time / dt)) / T
+    ref_trajectory = np.vstack([np.cos(r/2 - np.pi/2), np.sin(r), np.zeros(len(r))]).T
+    vel_trajectory = get_reference_velocity(ref_trajectory)
+    
+    # Generate 5 random unit vectors
+    wind_directions = np.random.randn(num_directions, 3)
+    wind_directions /= np.linalg.norm(wind_directions, axis=1)[:, np.newaxis]
+    
+    amplitudes = [0, 0.5, 1, 1.5, 2]
+    omegas = [0, 0.5, 1, 1.5, 2]
+    phi = 0.0
+
+    for wind_direction in tqdm(wind_directions):
+        for amplitude in amplitudes:
+            for omega in omegas:
+                quadcopter.reset_state_and_input(np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0, 0.0]))
+                run_simulation(quadcopter, ref_trajectory, vel_trajectory, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+                trajectory = np.array(quadcopter.trajectory)
+                omegas_motors = np.array(quadcopter.omegas_motors)
+                F_winds = np.array(quadcopter.F_winds)
+                np.save(data_dir / f"dir{wind_direction}_amp{amplitude}_omega{omega}_phi{phi}_trajectory.npy", trajectory)
+                np.save(data_dir / f"dir{wind_direction}_amp{amplitude}_omega{omega}_phi{phi}_omegas_motors.npy", omegas_motors)
+                np.save(data_dir / f"dir{wind_direction}_amp{amplitude}_omega{omega}_phi{phi}_F_winds.npy", F_winds)
+                print(f"Saved data for dir{wind_direction}_amp{amplitude}_omega{omega}_phi{phi}")
+    
+    print("Done")
+    
 
 def main():
     quadcopter = Robot()
@@ -274,7 +394,7 @@ def main():
 
     # exit()
     wind_direction = np.array([1, 0, 0])
-    amplitude = 1.0
+    amplitude = 0.0
     omega = 1.0
     phi = 0.0
 
@@ -295,5 +415,41 @@ def main():
     plt.grid(True)
     plt.show()
 
+def sim_with_model():
+    model_path = Path('/Users/yefan/Desktop/CDS245/simple-quad-sim/models/epoch850.pth')
+    phi_net = load_model(model_path)
+    quadcopter1 = Robot(phi_net=phi_net)
+    quadcopter2 = Robot()
+    sim_time = 20.0
+    T = 3
+    r = 2*np.pi * np.linspace(0, sim_time, int(sim_time / dt)) / T
+    ref_trajectory = np.vstack([np.cos(r/2 - np.pi/2), np.sin(r), np.zeros(len(r))]).T
+    vel_trajectory = get_reference_velocity(ref_trajectory)
+
+    wind_direction = np.array([1, 0, 0])
+    amplitude = 2
+    omega = 1
+    phi = 0.0
+
+    run_simulation_NF(quadcopter1, ref_trajectory, vel_trajectory, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+    trajectory1 = np.array(quadcopter1.trajectory)
+    run_simulation(quadcopter2, ref_trajectory, vel_trajectory, sim_time, wind_direction, amplitude, omega, phi, display_animation=False)
+    trajectory2 = np.array(quadcopter2.trajectory)
+    plt.figure()
+    plt.plot(ref_trajectory[:,0], ref_trajectory[:,1], 'r--', label='Reference Trajectory')
+    plt.plot(trajectory2[:,IDX_POS_X], trajectory2[:,IDX_POS_Y], 'g-', label='Trajectory')
+    plt.plot(trajectory1[:,IDX_POS_X], trajectory1[:,IDX_POS_Y], 'b-', label='NF Trajectory')
+    # plt.plot(ref_trajectory[0,0], ref_trajectory[0,1], 'go', markersize=10, label='Start')
+    # plt.plot(ref_trajectory[-1,0], ref_trajectory[-1,1], 'ro', markersize=10, label='End')
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.title('Reference vs Actual Trajectory (Top View)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+
 if __name__ == "__main__":
-    main()
+    # main()
+    sim_with_model()
